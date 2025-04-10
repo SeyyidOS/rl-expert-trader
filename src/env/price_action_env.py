@@ -1,11 +1,13 @@
+from typing import List, Optional, Dict, Any, Tuple
+from gymnasium import spaces
+
+import gymnasium as gym
+import pandas as pd
+import numpy as np
 import random
 import logging
-from typing import List, Optional, Dict, Any, Tuple
 
-import numpy as np
-import pandas as pd
-import gymnasium as gym
-from gymnasium import spaces
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 # ------------------------------------------------------------------------------
@@ -23,23 +25,16 @@ class TradingConfig:
     TRAIN_EVAL_FREQUENCY = 25000
     TOTAL_TIMESTEPS = 200_000
 
-    # Risk penalty hyperparameters (existing)
+    # New reward hyperparameters for normalized, unified rewards:
+    K_SCALE = 1.0  # Scaling factor to express returns as percentages
+    DENSE_SCALE = 0.01  # Scaling factor to express returns as percentages
+    TIME_PENALTY = 0.001  # Per-step penalty for holding a position
+    LIQUIDATION_PENALTY = 1.0  # Severe penalty (normalized) on liquidation
+
+    # (Other parameters may remain if needed)
     DRAWNDOWN_PENALTY_MULTIPLIER = 0.0005
     VOLATILITY_PENALTY_MULTIPLIER = 0.2
-
-    # New hyperparameters for decomposed reward components:
-    ALPHA_OPP_COST = 2.0  # Scale for opportunity cost penalty
-    GAMMA_UNREALIZED = 1.0  # Scale for unrealized profit (or loss)
-    DELTA_TIME = 0.001  # Time penalty per step when holding a position
-
-    # Volatility window (for risk penalty calculation)
     VOL_WINDOW = 50
-
-
-# ------------------------------------------------------------------------------
-# Logging Configuration
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 # ------------------------------------------------------------------------------
@@ -78,21 +73,27 @@ class TradeLogger:
 # ------------------------------------------------------------------------------
 class PriceActionEnv(gym.Env):
     """
-    Custom Trading Environment for Price Action Strategies.
+    Custom Trading Environment for Price Action Strategies with a unified reward structure.
 
-    The environment simulates trading using historical data with fees, leverage,
-    and risk management. Each episode lasts for a fixed number of steps, regardless
-    of open or closed positions. At the end of an episode, any open position is
-    force-closed. Additionally, the environment distinguishes between training and
-    evaluation mode:
-      - In "train" mode, data is sampled randomly and the episode resets are random.
-      - In "eval" mode, a fixed (deterministic) start index is used.
-
-    When running in training mode, the environment saves a trade log at the end
-    of each episode for later analysis.
+    Reward Structure:
+      * Dense (per-step) rewards:
+          - If in position:
+              - Dense Reward = K_SCALE * ((P_t / P_entry) - 1) [for long]
+                                or = K_SCALE * ((P_entry / P_t) - 1) [for short]
+                                minus a TIME_PENALTY.
+              - Reward components: "unrealized_component" and "time_penalty_component".
+          - If out of position:
+              - Dense Reward = -K_SCALE * ((P_t / P_{t-1}) - 1)
+                (reflects opportunity cost).
+      * Sparse rewards (event-driven):
+          - On trade closure:
+              - Sparse Reward = K_SCALE * (net return) - (cumulative time penalty)
+                with components "realized_component" and "cumulative_time_penalty".
+          - On liquidation:
+              - Sparse Reward = -LIQUIDATION_PENALTY.
     """
     metadata = {"render_modes": ["human"], "render_fps": 4}
-    # Define the direction mapping as a class-level constant.
+    # Action mapping: 0 => hold, 1 => long, 2 => short (here, 2 corresponds to -1)
     DIRECTION_MAP = {0: 0, 1: 1, 2: -1}
 
     def __init__(self,
@@ -100,38 +101,24 @@ class PriceActionEnv(gym.Env):
                  config: TradingConfig,
                  mode: str = "train",  # "train" or "eval"
                  render_mode: Optional[str] = None) -> None:
-        """
-        Args:
-            dfs (List[pd.DataFrame]): List of historical market data DataFrames.
-            config (TradingConfig): Configuration parameters.
-            mode (str): "train" for training (random start) or "eval" for evaluation (deterministic start).
-            render_mode (Optional[str]): If "human", rendering is enabled.
-        """
         super().__init__()
         self.dfs = dfs
         self.config = config
         self.mode = mode.lower()
         self.render_mode = render_mode
 
-        # Environment parameters.
         self.window_size = self.config.WINDOW_SIZE
         self.initial_balance = self.config.INITIAL_BALANCE
         self.fee = self.config.FEE_RATE
         self.leverage = self.config.LEVERAGE
 
-        # Account and risk management state.
         self.balance = self.initial_balance
         self.total_pnl = 0.0
-        self.trade_logger = TradeLogger()  # Use the dedicated logger class.
+        self.trade_logger = TradeLogger()
         self.max_balance = self.balance
-        self.reward_buffer: List[float] = []
 
-        # Cumulative reward components for the episode.
-        self.cum_trade_reward = 0.0
-        self.cum_opp_cost = 0.0
-        self.cum_unrealized_reward = 0.0
+        # Reset cumulative holding penalty for each trade.
         self.cum_time_penalty = 0.0
-        self.cum_risk_penalty = 0.0
 
         # Define action and observation spaces.
         self.action_space = spaces.MultiDiscrete([3, 10, 5])
@@ -139,9 +126,7 @@ class PriceActionEnv(gym.Env):
 
         self.position: Optional[Dict[str, Any]] = None
         self.current_step: int = 0
-        self.is_in_position: bool = False
 
-        # For episode management.
         self.episode_count = 0
 
         self._reset_session()
@@ -149,7 +134,6 @@ class PriceActionEnv(gym.Env):
     def _reset_session(self) -> None:
         """
         Resets the session by selecting a dataset and a starting index.
-        In eval mode, the start index is deterministic.
         """
         if self.mode == "eval":
             self.df = self.dfs[0].reset_index(drop=True)
@@ -161,27 +145,15 @@ class PriceActionEnv(gym.Env):
         self.start_step = self.current_step
 
         self.position = None
-        self.is_in_position = False
         self.balance = self.initial_balance
         self.total_pnl = 0.0
         self.trade_logger.clear()
         self.max_balance = self.balance
-        self.reward_buffer = []
-
-        # Reset cumulative reward component trackers.
-        self.cum_trade_reward = 0.0
-        self.cum_opp_cost = 0.0
-        self.cum_unrealized_reward = 0.0
         self.cum_time_penalty = 0.0
-        self.cum_risk_penalty = 0.0
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
         """
         Resets the environment for a new episode.
-        For training mode, saves the previous episode's trade log if available.
-
-        Returns:
-            Tuple[np.ndarray, dict]: The initial observation and an empty info dictionary.
         """
         if self.mode == "train" and self.episode_count > 0 and self.trade_logger.trades:
             filename = f"./logs/trade_logs/trade_log_episode_{self.episode_count}.csv"
@@ -196,9 +168,6 @@ class PriceActionEnv(gym.Env):
     def _get_observation(self) -> np.ndarray:
         """
         Constructs the current observation consisting of normalized recent price data and account features.
-
-        Returns:
-            np.ndarray: The observation vector.
         """
         prices = self.df['close'].iloc[self.current_step - self.window_size:self.current_step].values
         norm_prices = (prices - prices.min()) / (prices.max() - prices.min() + 1e-8)
@@ -206,39 +175,34 @@ class PriceActionEnv(gym.Env):
             self.balance / self.initial_balance,
             float(self.position['direction']) if self.position else 0.0,
             self.position['entry_price'] / prices[-1] if self.position else 0.0,
-            self.position['capital'] / self.balance if self.position else 0.0
+            0.0  # Placeholder for additional features
         ])
         return np.concatenate([norm_prices, extra_features]).astype(np.float32)
 
     def _open_position(self, direction: int, price: float, size_percent: float, sl_pct: float) -> None:
         """
         Opens a new trading position.
-
-        Args:
-            direction (int): +1 for long, -1 for short.
-            price (float): Current market price.
-            size_percent (float): Fraction of the balance to allocate.
-            sl_pct (float): Stop loss percentage.
         """
-        self.is_in_position = True
-        # Allocate the capital at risk.
         capital = self.balance * size_percent
-        leverage_capital = capital * self.leverage
         self.position = {
             "capital": capital,
             "direction": direction,
             "entry_price": price,
             "leverage": self.leverage,
             "stop_loss_pct": sl_pct,
-            "quantity": leverage_capital / price
+            "quantity": capital * self.leverage / price
         }
-        fee_cost = leverage_capital * self.fee
+        fee_cost = capital * self.leverage * self.fee
         self.balance -= fee_cost
         self.total_pnl -= fee_cost
+
+        # Reset cumulative time penalty for this new trade.
+        self.cum_time_penalty = 0.0
 
         trade_event = {
             "step": self.current_step,
             "type": "OPEN",
+            "balance": self.balance,
             "dir": direction,
             "price": price,
             "capital": capital,
@@ -247,20 +211,36 @@ class PriceActionEnv(gym.Env):
         }
         self.trade_logger.log_trade(trade_event)
 
-    def _close_position(self, price: float) -> float:
+    def _close_position(self, price: float) -> Tuple[float, Dict[str, float]]:
         """
-        Closes the current position and returns a trade reward computed as the percentage return
-        on the allocated capital.
-
-        Args:
-            price (float): Price at which the position is closed.
-
-        Returns:
-            float: Trade reward (percentage return relative to allocated capital).
+        Closes the current position and returns a tuple:
+          (sparse_reward, breakdown)
+        The breakdown contains:
+          - realized_component: K_SCALE * (net return)
+          - cumulative_time_penalty: the accumulated penalty while holding
+          - sparse_reward: (realized_component - cumulative_time_penalty)
+        The account balance is updated accordingly.
         """
-        self.is_in_position = False
         p = self.position  # type: ignore
-        pnl = (price - p["entry_price"]) * p["quantity"] * p["direction"]
+        entry_price = p["entry_price"]
+        direction = p["direction"]
+
+        if direction == 1:
+            net_return = (price / entry_price) - 1.0
+        else:
+            net_return = (entry_price / price) - 1.0
+
+        realized_component = self.config.K_SCALE * net_return
+        time_penalty_component = self.cum_time_penalty
+        sparse_reward = realized_component - time_penalty_component
+
+        reward_breakdown = {
+            "realized_component": realized_component,
+            # "cumulative_time_penalty": time_penalty_component,
+            "sparse_reward": sparse_reward
+        }
+
+        pnl = p["capital"] * self.leverage * net_return
         fee_cost = abs(p["quantity"]) * price * self.fee
         self.balance += pnl - fee_cost
         self.total_pnl += pnl - fee_cost
@@ -268,26 +248,24 @@ class PriceActionEnv(gym.Env):
         trade_event = {
             "step": self.current_step,
             "type": "CLOSE",
-            "exit_price": price,
+            "balance": self.balance,
+            "price": price,
+            "capital": p["capital"],
+            "leverage": self.leverage,
+            "fee_cost": fee_cost,
+            "net_return": net_return,
             "pnl": pnl,
-            "fee_cost": fee_cost
         }
         self.trade_logger.log_trade(trade_event)
 
         self.position = None
-        # Compute trade reward as percentage return on allocated capital.
-        trade_reward = (pnl - fee_cost) / (p["capital"] + 1e-8)
-        return trade_reward
+        self.cum_time_penalty = 0.0
+
+        return sparse_reward, reward_breakdown
 
     def _check_stop_loss(self, price: float) -> bool:
         """
         Checks if the current price triggers the stop loss condition.
-
-        Args:
-            price (float): Current price.
-
-        Returns:
-            bool: True if stop loss is hit.
         """
         if not self.position:
             return False
@@ -300,187 +278,112 @@ class PriceActionEnv(gym.Env):
     def _is_liquidated(self) -> bool:
         """
         Determines if the account is liquidated.
-
-        Returns:
-            bool: True if the balance is too low.
         """
         return self.balance <= 10
 
     def _is_terminal(self) -> bool:
         """
         Checks if the episode should terminate.
-
-        Returns:
-            bool: True if the episode is over.
         """
         episode_ended = self.current_step >= self.start_step + self.config.EPISODE_LENGTH
         end_of_data = self.current_step >= len(self.df) - 1
         return self._is_liquidated() or episode_ended or end_of_data
 
-    def _terminal_reward(self) -> float:
+    def _terminal_reward(self) -> Tuple[float, Optional[Dict[str, float]]]:
         """
-        Computes the terminal reward. If a position is open at the end of the episode,
-        a forced close is executed.
-
-        Returns:
-            float: The final reward after forced closure.
+        Computes the terminal reward.
+          - If liquidated: returns (-LIQUIDATION_PENALTY, breakdown)
+          - If a position is open: force-close the position.
         """
         if self._is_liquidated():
-            return -self.balance
+            breakdown = {
+                "liquidation_penalty": self.config.LIQUIDATION_PENALTY,
+                "sparse_reward": -self.config.LIQUIDATION_PENALTY
+            }
+            return -self.config.LIQUIDATION_PENALTY, breakdown
         if self.position:
             forced_close_price = self.df.loc[self.current_step, "close"]
             logging.info("Forced closing position at terminal step %d, price: %.2f", self.current_step,
                          forced_close_price)
-            self._close_position(forced_close_price)
-        return self.total_pnl
-
-    def _update_max_balance(self) -> None:
-        """Updates the maximum balance reached."""
-        if self.balance > self.max_balance:
-            self.max_balance = self.balance
-
-    def _compute_drawdown_penalty(self) -> float:
-        """
-        Computes the normalized drawdown penalty as the percentage drawdown multiplied
-        by the configured multiplier.
-        """
-        if self.balance < self.max_balance:
-            # Compute the drawdown fraction relative to the maximum balance.
-            drawdown_fraction = (self.max_balance - self.balance) / self.max_balance
-            return drawdown_fraction * self.config.DRAWNDOWN_PENALTY_MULTIPLIER
-        return 0.0
-
-    def _compute_volatility_penalty(self) -> float:
-        """
-        Computes the volatility penalty based on the standard deviation of recent reward values.
-        Optionally, we can normalize the volatility by the mean absolute reward over the window.
-        """
-        if len(self.reward_buffer) < 2:
-            return 0.0
-
-        # Compute the raw volatility (standard deviation).
-        vol = np.std(self.reward_buffer[-self.config.VOL_WINDOW:])
-
-        # Optional: Normalize volatility by the mean absolute reward to get a relative measure.
-        # Uncomment the following lines if you wish to use normalization.
-        # mean_abs = np.mean(np.abs(self.reward_buffer[-self.config.VOL_WINDOW:]))
-        # if mean_abs > 1e-8:
-        #     vol = vol / mean_abs
-
-        return vol * self.config.VOLATILITY_PENALTY_MULTIPLIER
-
-    def _compute_risk_penalty(self) -> float:
-        """Aggregates drawdown and volatility penalties."""
-        return self._compute_drawdown_penalty() + self._compute_volatility_penalty()
+            return self._close_position(forced_close_price)
+        return 0.0, None
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """
-        Executes the given action, computes reward components, and returns the new state.
-
-        Reward components:
-          - Trade Reward: Percentage return on allocated capital if a trade is closed.
-          - Opportunity Cost: Applied when idle during upward market trends.
-          - Unrealized Reward: Percentage return on an open position.
-          - Time Penalty: A small constant penalty per step when holding a position.
-          - Risk Penalty: Computed from drawdown and volatility.
-
-        Both instantaneous (per step) and cumulative reward component sums are added to the info dictionary.
-
-        Returns:
-            Tuple (observation, adjusted reward, done flag, truncation flag, info dict).
+        Executes the given action and computes rewards using the unified reward structure.
+        In addition, a dictionary 'reward_components' is built containing the contribution of each component.
         """
         direction_code, size_code, sl_code = action
-        direction = self.DIRECTION_MAP[direction_code]
-        size_percent = (size_code + 1) / 10
-        sl_pct = 0.005 * (sl_code + 1)
+        action_direction = self.DIRECTION_MAP[direction_code]
+        size_percent = (size_code + 1) / 10  # fraction of balance to allocate
+        sl_pct = 0.005 * (sl_code + 1)  # stop loss percentage
 
         price = self.df.loc[self.current_step, "close"]
+        reward = 0.0
+        reward_components: Dict[str, Any] = {}
 
-        # Initialize instantaneous reward components.
-        trade_reward = 0.0
-        opp_cost = 0.0
-        unrealized_reward = 0.0
-        time_penalty = 0.0
-
-        # --- Position Management ---
         if self.position:
-            if self._check_stop_loss(price) or (direction == 0):
-                trade_reward = self._close_position(price)
-            # Otherwise, continue holding the position.
-        elif direction != 0:
-            self._open_position(direction, price, size_percent, sl_pct)
-
-        # --- Opportunity Cost (when idle) ---
-        if not self.is_in_position and self.current_step > 0:
-            prev_price = self.df.loc[self.current_step - 1, "close"]
-            market_return = (price - prev_price) / (prev_price + 1e-8)
-            if market_return > 0:
-                opp_cost = -abs(market_return * self.config.ALPHA_OPP_COST)
-
-        # --- Unrealized Reward & Time Penalty (for open position) ---
-        if self.is_in_position and self.position:
-            p = self.position
-            # Compute percentage return based on current price.
-            if p["direction"] == 1:
-                unrealized = (price - p["entry_price"]) / p["entry_price"]
+            # If the agent signals to close (action_direction == 0) or if stop loss triggers:
+            if action_direction == 0 or self._check_stop_loss(price):
+                reward, breakdown = self._close_position(price)
+                reward_components.update(breakdown)
             else:
-                unrealized = (p["entry_price"] - price) / p["entry_price"]
-            unrealized_reward = unrealized * self.config.GAMMA_UNREALIZED
-            time_penalty = self.config.DELTA_TIME
-
-        # --- Combine Instantaneous Reward Components ---
-        if trade_reward != 0.0:
-            reward = trade_reward
-        elif self.is_in_position:
-            reward = unrealized_reward - time_penalty
+                # Continue holding: accumulate a time penalty.
+                self.cum_time_penalty += self.config.TIME_PENALTY
+                if self.position["direction"] == 1:
+                    unrealized_component = self.config.DENSE_SCALE * ((price / self.position["entry_price"]) - 1)
+                else:
+                    unrealized_component = self.config.DENSE_SCALE * ((self.position["entry_price"] / price) - 1)
+                time_penalty_component = self.config.TIME_PENALTY
+                dense_reward = unrealized_component - time_penalty_component
+                reward = dense_reward
+                reward_components = {
+                    "unrealized_component": unrealized_component,
+                    "time_penalty_component": time_penalty_component,
+                    "dense_reward": dense_reward
+                }
         else:
-            reward = opp_cost
-
-        # --- Update Cumulative Reward Component Sums ---
-        self.cum_trade_reward += trade_reward
-        self.cum_opp_cost += opp_cost
-        self.cum_unrealized_reward += unrealized_reward
-        self.cum_time_penalty += time_penalty
-        # Risk penalty is computed each step, so accumulate it as well.
-        risk_penalty = self._compute_risk_penalty()
-        self.cum_risk_penalty += risk_penalty
-
-        # --- Final Reward ---
-        adjusted_reward = reward - risk_penalty
+            # When not in a position:
+            if action_direction != 0:
+                # Open a new position; reward is zero at the moment of opening.
+                self._open_position(action_direction, price, size_percent, sl_pct)
+            else:
+                # Compute opportunity cost from market movement.
+                if self.current_step > self.window_size:
+                    prev_price = self.df.loc[self.current_step - 1, "close"]
+                    opportunity_cost = -self.config.DENSE_SCALE * ((price / prev_price) - 1)
+                    reward = opportunity_cost
+                    reward_components = {
+                        "opportunity_cost": opportunity_cost,
+                        "dense_reward": opportunity_cost
+                    }
+                else:
+                    reward = 0.0
+                    reward_components = {"dense_reward": 0.0}
 
         self.current_step += 1
-        self._update_max_balance()
-        self.reward_buffer.append(reward)
+        if self.balance > self.max_balance:
+            self.max_balance = self.balance
 
         done = self._is_terminal()
         if done:
-            adjusted_reward += self._terminal_reward()
+            terminal_reward, terminal_breakdown = self._terminal_reward()
+            reward += terminal_reward
+            if terminal_breakdown:
+                reward_components["terminal"] = terminal_breakdown
 
-        # Prepare the info dictionary with both instantaneous and cumulative reward components.
         info = {
             "balance": self.balance,
             "total_pnl": self.total_pnl,
             "position": self.position,
-            "instant_reward_components": {
-                "trade_reward": trade_reward,
-                "opp_cost": opp_cost,
-                "unrealized_reward": unrealized_reward,
-                "time_penalty": time_penalty,
-                "risk_penalty": risk_penalty
-            },
-            "cumulative_reward_components": {
-                "trade_reward": self.cum_trade_reward,
-                "opp_cost": self.cum_opp_cost,
-                "unrealized_reward": self.cum_unrealized_reward,
-                "time_penalty": self.cum_time_penalty,
-                "risk_penalty": self.cum_risk_penalty
-            }
+            "reward_components": reward_components,
+            "raw_reward": reward  # final reward at this step (dense or sparse event)
         }
 
         if self.render_mode == "human":
             self.render()
 
-        return self._get_observation(), adjusted_reward, done, False, info
+        return self._get_observation(), reward, done, False, info
 
     def render(self) -> None:
         """Logs the current state of the environment."""
@@ -491,8 +394,8 @@ class PriceActionEnv(gym.Env):
         logging.info("Balance     : $%.2f", self.balance)
         if self.position:
             side = "LONG" if self.position["direction"] == 1 else "SHORT"
-            logging.info("Position    : %s, Capital: %.4f @ $%.2f", side, self.position["capital"],
-                         self.position["entry_price"])
+            logging.info("Position    : %s, Capital: %.4f @ $%.2f",
+                         side, self.position["capital"], self.position["entry_price"])
             logging.info("Stop Loss   : %.2f%%", self.position["stop_loss_pct"] * 100)
         else:
             logging.info("Position    : None")
