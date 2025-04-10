@@ -1,5 +1,4 @@
 import logging
-
 import gymnasium
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -32,7 +31,9 @@ def load_market_data() -> Dict[str, pd.DataFrame]:
 # -------------------------------------------------------------------
 # Environment Creation Function
 # -------------------------------------------------------------------
-def create_eval_env(data: Dict[str, pd.DataFrame], config: TradingConfig, render_mode: str = None) -> PriceActionEnv:
+def create_eval_env(data: Dict[str, pd.DataFrame],
+                    config: TradingConfig,
+                    render_mode: str = None) -> PriceActionEnv:
     """
     Creates a monitored evaluation environment using ETH data.
 
@@ -42,7 +43,7 @@ def create_eval_env(data: Dict[str, pd.DataFrame], config: TradingConfig, render
         render_mode (str, optional): Rendering mode.
 
     Returns:
-        Monitor: A monitored evaluation environment.
+        PriceActionEnv: An evaluation environment instance.
     """
     eth_df = data["eth"]
     env_instance = PriceActionEnv([eth_df], config, mode="eval", render_mode=render_mode)
@@ -55,12 +56,12 @@ def create_eval_env(data: Dict[str, pd.DataFrame], config: TradingConfig, render
 def run_evaluation(eval_env: PriceActionEnv) -> Dict[str, Any]:
     """
     Runs one evaluation episode using the given environment.
-    It collects and returns information on the reward components,
-    account balance, total PnL, and step indices.
+    It collects and returns the history of reward info,
+    account balance, total PnL, and steps.
 
     Returns:
-        Dict[str, Any]: A dictionary with keys:
-            - "info_history": list of info dicts per step.
+        Dict[str, Any]: Dictionary with keys:
+            - "info_history": list of info dictionaries per step.
             - "balance_history": account balance per step.
             - "pnl_history": total PnL per step.
             - "steps": list of step indices.
@@ -71,6 +72,7 @@ def run_evaluation(eval_env: PriceActionEnv) -> Dict[str, Any]:
     pnl_history: List[float] = []
     steps: List[int] = []
 
+    # Load the trained PPO model.
     model = PPO.load("./logs/checkpoints/best_model.zip")
     obs, _ = eval_env.reset()
     done = False
@@ -79,7 +81,7 @@ def run_evaluation(eval_env: PriceActionEnv) -> Dict[str, Any]:
     step = 0
 
     while not (done or truncated):
-        action, _states = model.predict(obs, deterministic=True)
+        action, _ = model.predict(obs, deterministic=True)
         # action = eval_env.action_space.sample()
         obs, reward, done, truncated, info = eval_env.step(action)
         total_reward += reward
@@ -106,25 +108,59 @@ def run_evaluation(eval_env: PriceActionEnv) -> Dict[str, Any]:
 # -------------------------------------------------------------------
 # Plotting Functions
 # -------------------------------------------------------------------
-def plot_cumulative_rewards(info_history: List[Dict[str, Any]], steps: List[int]) -> None:
+def plot_reward_components(info_history: List[Dict[str, Any]], steps: List[int]) -> None:
     """
-    Plots the cumulative reward components over steps.
-    """
-    cum_trade = [info["cumulative_reward_components"]["trade_reward"] for info in info_history]
-    cum_opp = [info["cumulative_reward_components"]["opp_cost"] for info in info_history]
-    cum_unrealized = [info["cumulative_reward_components"]["unrealized_reward"] for info in info_history]
-    cum_time = [info["cumulative_reward_components"]["time_penalty"] for info in info_history]
-    cum_risk = [info["cumulative_reward_components"]["risk_penalty"] for info in info_history]
+    Extracts and plots each reward component on its own subplot.
 
-    plt.figure(figsize=(12, 8))
-    plt.plot(steps, cum_trade, label="Cumulative Trade Reward")
-    plt.plot(steps, cum_opp, label="Cumulative Opportunity Cost")
-    plt.plot(steps, cum_unrealized, label="Cumulative Unrealized Reward")
-    plt.plot(steps, cum_time, label="Cumulative Time Penalty")
-    plt.plot(steps, cum_risk, label="Cumulative Risk Penalty")
-    plt.title("Cumulative Reward Components Over Steps")
+    It builds time series for each key in the "reward_components" dictionary (found in the
+    info dict returned by the environment), using a default value 0 when missing.
+    """
+    # Determine the union of reward component keys over all steps.
+    component_keys = set()
+    for info in info_history:
+        rc = info.get("reward_components", {})
+        component_keys.update(rc.keys())
+
+    # Build time series for each component key.
+    components_data = {k: [] for k in component_keys}
+    for info in info_history:
+        rc = info.get("reward_components", {})
+        for k in component_keys:
+            value = rc.get(k, 0)
+            # In case the value is a nested dict (e.g., terminal breakdown),
+            # try to get "sparse_reward" if available; otherwise sum the values.
+            if isinstance(value, dict):
+                value = value.get("sparse_reward", sum(value.values()))
+            components_data[k].append(value)
+
+    num_components = len(component_keys)
+    fig, axs = plt.subplots(num_components, 1, figsize=(12, 3 * num_components), sharex=True)
+
+    if num_components == 1:
+        axs = [axs]
+
+    for ax, key in zip(axs, sorted(component_keys)):
+        ax.plot(steps, components_data[key], label=key)
+        ax.set_title(f"{key} Over Steps")
+        ax.set_ylabel("Reward Value (Normalized)")
+        ax.legend()
+        ax.grid(True)
+
+    axs[-1].set_xlabel("Step")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_raw_rewards(info_history: List[Dict[str, Any]], steps: List[int]) -> None:
+    """
+    Plots the overall (raw) reward received at each step.
+    """
+    raw_rewards = [info.get("raw_reward", 0) for info in info_history]
+    plt.figure(figsize=(12, 6))
+    plt.plot(steps, raw_rewards, label="Raw Reward", color="purple")
+    plt.title("Overall (Raw) Reward Over Steps")
     plt.xlabel("Step")
-    plt.ylabel("Reward Component (Percentage)")
+    plt.ylabel("Reward")
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -145,30 +181,6 @@ def plot_account_metrics(steps: List[int], balance_history: List[float], pnl_his
     plt.show()
 
 
-def plot_instantaneous_rewards(info_history: List[Dict[str, Any]], steps: List[int]) -> None:
-    """
-    Plots the instantaneous reward components over steps.
-    """
-    inst_trade = [info["instant_reward_components"]["trade_reward"] for info in info_history]
-    inst_opp = [info["instant_reward_components"]["opp_cost"] for info in info_history]
-    inst_unrealized = [info["instant_reward_components"]["unrealized_reward"] for info in info_history]
-    inst_time = [info["instant_reward_components"]["time_penalty"] for info in info_history]
-    inst_risk = [info["instant_reward_components"]["risk_penalty"] for info in info_history]
-
-    plt.figure(figsize=(12, 8))
-    plt.plot(steps, inst_trade, label="Instant Trade Reward")
-    plt.plot(steps, inst_opp, label="Instant Opportunity Cost")
-    plt.plot(steps, inst_unrealized, label="Instant Unrealized Reward")
-    plt.plot(steps, inst_time, label="Instant Time Penalty")
-    plt.plot(steps, inst_risk, label="Instant Risk Penalty")
-    plt.title("Instantaneous Reward Components Over Steps")
-    plt.xlabel("Step")
-    plt.ylabel("Reward Component (Percentage)")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-
 # -------------------------------------------------------------------
 # Main Function
 # -------------------------------------------------------------------
@@ -179,9 +191,11 @@ def main():
     eval_env = create_eval_env(data, config, render_mode=None)
     eval_results = run_evaluation(eval_env)
 
-    plot_cumulative_rewards(eval_results["info_history"], eval_results["steps"])
-    plot_account_metrics(eval_results["steps"], eval_results["balance_history"], eval_results["pnl_history"])
-    plot_instantaneous_rewards(eval_results["info_history"], eval_results["steps"])
+    plot_reward_components(eval_results["info_history"], eval_results["steps"])
+    plot_raw_rewards(eval_results["info_history"], eval_results["steps"])
+    plot_account_metrics(eval_results["steps"],
+                         eval_results["balance_history"],
+                         eval_results["pnl_history"])
 
 
 if __name__ == '__main__':
