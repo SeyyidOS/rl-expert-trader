@@ -1,0 +1,3 @@
+PPO:
+  total_ts: 500_000
+  eval_freq: 25000
