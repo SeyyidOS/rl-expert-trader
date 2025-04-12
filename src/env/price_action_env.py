@@ -1,4 +1,5 @@
 from typing import List, Optional, Dict, Any, Tuple
+from src.utils.logger import TradeLogger
 from gymnasium import spaces
 
 import gymnasium as gym
@@ -35,37 +36,6 @@ class TradingConfig:
     DRAWNDOWN_PENALTY_MULTIPLIER = 0.0005
     VOLATILITY_PENALTY_MULTIPLIER = 0.2
     VOL_WINDOW = 50
-
-
-# ------------------------------------------------------------------------------
-# Dedicated Trade Logger Class
-# ------------------------------------------------------------------------------
-class TradeLogger:
-    """
-    A dedicated class for logging trade events.
-
-    This class collects trade events and can save the log to a CSV file for later analysis.
-    """
-
-    def __init__(self) -> None:
-        self.trades: List[Dict[str, Any]] = []
-
-    def log_trade(self, trade: Dict[str, Any]) -> None:
-        """Appends a trade dictionary to the log."""
-        self.trades.append(trade)
-
-    def save(self, path: str) -> None:
-        """Saves the trade log to a CSV file at the given path."""
-        if not self.trades:
-            logging.warning("No trades to save.")
-            return
-        df = pd.DataFrame(self.trades)
-        df.to_csv(path, index=False)
-        logging.info("Trade log saved to %s", path)
-
-    def clear(self) -> None:
-        """Clears the logged trades."""
-        self.trades.clear()
 
 
 # ------------------------------------------------------------------------------
