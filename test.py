@@ -5,8 +5,8 @@ import pandas as pd
 from typing import Dict, List, Any
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.monitor import Monitor
 from src.env.price_action_env import PriceActionEnv, TradingConfig
+from src.env.spot_trading_env import SpotTradingEnv
 
 
 # -------------------------------------------------------------------
@@ -46,7 +46,7 @@ def create_eval_env(data: Dict[str, pd.DataFrame],
         PriceActionEnv: An evaluation environment instance.
     """
     eth_df = data["eth"]
-    env_instance = PriceActionEnv([eth_df], config, mode="eval", render_mode=render_mode)
+    env_instance = SpotTradingEnv([eth_df], mode="eval", render_mode=render_mode)
     return env_instance
 
 

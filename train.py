@@ -9,7 +9,8 @@ from stable_baselines3.common.callbacks import EvalCallback
 
 # Import your custom trading environment and its config.
 from src.env.price_action_env import PriceActionEnv, TradingConfig
-
+from src.env.spot_trading_env import SpotTradingEnv
+from src.utils.helper import load_config
 
 # ------------------------------------------------------------------------------
 # Data Loading and Environment Factory Functions
@@ -35,7 +36,7 @@ def load_market_data() -> Dict[str, pd.DataFrame]:
     return {key: pd.read_csv(path) for key, path in data_files.items()}
 
 
-def make_train_env(data: Dict[str, pd.DataFrame], config: TradingConfig) -> Monitor:
+def make_train_env(data: Dict[str, pd.DataFrame]) -> Monitor:
     """
     Creates a monitored training environment using all assets except ETH.
 
@@ -48,11 +49,12 @@ def make_train_env(data: Dict[str, pd.DataFrame], config: TradingConfig) -> Moni
     """
     # Exclude ETH from training, so that training uses diverse datasets.
     dfs = [df for key, df in data.items() if key != "eth"]
-    env_instance = PriceActionEnv(dfs, config, mode="train")
+    # env_instance = PriceActionEnv(dfs, config, mode="train")
+    env_instance = SpotTradingEnv(dfs, mode="train")
     return Monitor(env_instance)
 
 
-def make_eval_env(data: Dict[str, pd.DataFrame], config: TradingConfig) -> Monitor:
+def make_eval_env(data: Dict[str, pd.DataFrame]) -> Monitor:
     """
     Creates a monitored evaluation environment using a subset of ETH data.
 
@@ -65,7 +67,8 @@ def make_eval_env(data: Dict[str, pd.DataFrame], config: TradingConfig) -> Monit
     """
     # Use a subset of ETH data (e.g., last 2400 data points) for evaluation.
     eth_df = data["eth"]
-    env_instance = PriceActionEnv([eth_df[-2400:]], config, mode="eval")
+    # env_instance = PriceActionEnv([eth_df[-2400:]], config, mode="eval")
+    env_instance = SpotTradingEnv([eth_df[-2400:]], mode="eval")
     return Monitor(env_instance)
 
 
@@ -78,19 +81,20 @@ def train_model():
     This function loads market data, creates training and evaluation environments,
     and trains the PPO model with periodic evaluation callbacks.
     """
-    config = TradingConfig()
+
+    config = load_config("./config/rl/ppo.yaml")["PPO"]
     data = load_market_data()
 
     # Wrap environments with DummyVecEnv as required by Stable Baselines3.
-    train_env = DummyVecEnv([lambda: make_train_env(data, config)])
-    eval_env = DummyVecEnv([lambda: make_eval_env(data, config)])
+    train_env = DummyVecEnv([lambda: make_train_env(data)])
+    eval_env = DummyVecEnv([lambda: make_eval_env(data)])
 
     # Set up the evaluation callback for periodic model evaluation and checkpointing.
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path="./logs/checkpoints/",
         log_path="./logs/evaluation_logs/",
-        eval_freq=config.TRAIN_EVAL_FREQUENCY,
+        eval_freq=config["eval_freq"],
         deterministic=True,
         render=False,
     )
@@ -103,11 +107,11 @@ def train_model():
         n_steps=512,
         batch_size=64,
         learning_rate=3e-4,
-        tensorboard_log="./logs/tensorboard/"
+        tensorboard_log="./logs/tensorboard/SpotTradingEnv_PNL",
     )
 
     logging.info("Starting model training...")
-    model.learn(total_timesteps=config.TOTAL_TIMESTEPS, callback=eval_callback, progress_bar=True)
+    model.learn(total_timesteps=config["total_ts"], callback=eval_callback, progress_bar=True)
     logging.info("Training completed. Saving model...")
     model.save("./logs/last_model")
     logging.info("Model saved successfully.")
