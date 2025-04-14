@@ -75,7 +75,7 @@ class SpotTradingEnv(gym.Env):
     def _get_observation(self) -> np.ndarray:
         """
         Constructs the observation consisting of:
-          - A window of the last `window_size` normalized closing prices.
+          - A window of the last window_size normalized closing prices.
           - A binary flag (1.0 if a position is open; otherwise 0.0).
           - The current balance normalized by the initial balance.
         """
@@ -83,13 +83,13 @@ class SpotTradingEnv(gym.Env):
         # Min-max normalization of the price window:
         norm_prices = (window_prices - window_prices.min()) / (window_prices.max() - window_prices.min() + 1e-8)
 
-
         # Extra features: position flag and balance ratio.
         position_flag = np.array([1.0]) if self.position is not None else np.array([0.0])
         balance_feature = np.array([self.balance / self.initial_balance])
 
         if self.position:
-            entry_price_norm = (self.position["entry_price"] - window_prices.min()) / (window_prices.max() - window_prices.min() + 1e-8)
+            entry_price_norm = (self.position["entry_price"] - window_prices.min()) / (
+                    window_prices.max() - window_prices.min() + 1e-8)
             entry_price_norm = np.array([entry_price_norm])
         else:
             entry_price_norm = np.array([-1.0])
@@ -160,6 +160,7 @@ class SpotTradingEnv(gym.Env):
         pnl = (price - entry_price) * p["quantity"]
         fee_cost = abs(p["quantity"]) * price * self.fee
         net_pnl = pnl - fee_cost
+        normalized_net_pnl = (pnl - fee_cost) / p["capital"]
 
         self.balance += pnl - fee_cost
         self.total_pnl += pnl - fee_cost
@@ -170,15 +171,15 @@ class SpotTradingEnv(gym.Env):
             "close_step": self.current_step,
             "duration": self.current_step - p["entry_step"],
             "balance": self.balance,
-            "entry_price": p["entry_price"],
-            "price": price,
             "capital": p["capital"],
             "fee_cost": fee_cost,
+            "entry_price": p["entry_price"],
+            "close_price": price,
             "pnl": pnl,
-            "net_pnl": net_pnl
+            "net_pnl": net_pnl,
+            "normalized_net_pnl": normalized_net_pnl
         }
 
-        normalized_net_pnl = (pnl-fee_cost) / p["capital"]
         reward_breakdown = {
             "normalized_net_pnl": normalized_net_pnl,
         }
@@ -208,6 +209,11 @@ class SpotTradingEnv(gym.Env):
         is_liquidate = self.balance <= self.initial_balance * 0.05
         return is_liquidate or episode_ended or end_of_data
 
+    def _terminal_reward(self) -> float:
+        if self.balance < self.initial_balance:
+            return -5.0
+        return 0.0
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
         """
         Resets the environment for a new episode.
@@ -232,25 +238,34 @@ class SpotTradingEnv(gym.Env):
             updates the balance, and sets the reward equal to the profit.
           - Hold (action 0) or an invalid action for the current state leaves the environment unchanged.
         """
+        episode_ended = self.current_step >= self.start_step + self.episode_length
         current_price = self.df.loc[self.current_step, 'close']
-        reward = 0.0
         reward_components: Dict[str, Any] = {}
+        reward = 0.0
 
         if self.position:
-            if action == 2 or self._check_stop_loss(current_price):
+            if action == 2 or episode_ended:
                 reward, reward_components = self._close_position(current_price)
                 if action != 2:
                     logging.info(f"SL - Reward: {reward}\tBalance: {self.balance}")
-            # elif action == 1:
-            #     reward -= self.wrong_action_punishment
+            elif action == 1:
+                reward -= self.wrong_action_punishment
+                reward_components['wrong_action_punishment'] = self.wrong_action_punishment
+
         else:
             if action == 1:
                 self._open_position(1, current_price, self.size_pct, self.sl_pct)
-            # elif action == 2:
-            #     reward -= self.wrong_action_punishment
+            elif action == 2:
+                reward -= self.wrong_action_punishment
+                reward_components['wrong_action_punishment'] = self.wrong_action_punishment
 
         self.current_step += 1
         done = self._is_terminal()
+
+        if done:
+            terminal_reward = self._terminal_reward()
+            reward_components['terminal_reward'] = terminal_reward
+            reward += terminal_reward
 
         info = {
             "balance": self.balance,
