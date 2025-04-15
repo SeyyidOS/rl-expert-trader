@@ -10,13 +10,13 @@ class CustomLSTMExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, hidden_size=128):
         # For instance, assume observation_space.shape[0] is the feature dimension.
         super(CustomLSTMExtractor, self).__init__(observation_space, features_dim=hidden_size)
-        self.lstm = nn.LSTM(input_size=observation_space.shape[0], hidden_size=hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(input_size=observation_space.spaces["window"].shape[-1], hidden_size=hidden_size, batch_first=True)
         # Optionally add a fully connected layer or other layers.
 
     def forward(self, observations):
         # Assume observations shape is [batch, sequence_length, feature_dim].
         # If your observations are not sequences, you may need to reshape or adapt accordingly.
-        lstm_out, _ = self.lstm(observations)
+        lstm_out, _ = self.lstm(observations["window"])
         # We take the output from the last time step
         return lstm_out[:, -1, :]
 
