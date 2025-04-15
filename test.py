@@ -33,7 +33,7 @@ def load_market_data() -> Dict[str, pd.DataFrame]:
 # -------------------------------------------------------------------
 def create_eval_env(data: Dict[str, pd.DataFrame],
                     config: TradingConfig,
-                    render_mode: str = None) -> PriceActionEnv:
+                    render_mode: str = None) -> gymnasium.Env:
     """
     Creates a monitored evaluation environment using ETH data.
 
@@ -45,15 +45,14 @@ def create_eval_env(data: Dict[str, pd.DataFrame],
     Returns:
         PriceActionEnv: An evaluation environment instance.
     """
-    eth_df = data["eth"]
-    env_instance = SpotTradingEnv([eth_df], mode="eval", render_mode=render_mode)
+    env_instance = SpotTradingEnv(data, mode="eval", render_mode=render_mode)
     return env_instance
 
 
 # -------------------------------------------------------------------
 # Evaluation Runner Function
 # -------------------------------------------------------------------
-def run_evaluation(eval_env: PriceActionEnv) -> Dict[str, Any]:
+def run_evaluation(eval_env: gymnasium.Env) -> Dict[str, Any]:
     """
     Runs one evaluation episode using the given environment.
     It collects and returns the history of reward info,
@@ -73,7 +72,7 @@ def run_evaluation(eval_env: PriceActionEnv) -> Dict[str, Any]:
     steps: List[int] = []
 
     # Load the trained PPO model.
-    model = PPO.load("./logs/checkpoints/best_model.zip")
+    model = PPO.load("./logs/tensorboard/SpotTrading-CustomLSTM-PNL/PPO_run_20250415_223147/model/last_model.zip")
     obs, _ = eval_env.reset()
     done = False
     truncated = False
